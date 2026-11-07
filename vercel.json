@@ -1,0 +1,3 @@
+{
+  "functions": { "api/deportes.js": { "maxDuration": 15 } }
+}

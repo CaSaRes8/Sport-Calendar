@@ -1,49 +1,45 @@
-import ical from 'ical';
+import { Buffer } from 'node:buffer'; // (sin uso real; se puede borrar, no afecta)
 
-const YEAR = 2026;
-const YEAR_START = Date.UTC(YEAR, 0, 1);
-const YEAR_END = Date.UTC(YEAR + 1, 0, 1);
 const FD = 'https://api.football-data.org/v4';
+const GH = 'https://raw.githubusercontent.com/motorsport-calendars/calendars/main/';
 
-// Equipos (football-data.org). El ID del Dépor se puede sobrescribir con DEPOR_ID.
+// Equipos a destacar en LaLiga y en Champions (football-data.org)
 const TEAMS = [
   { id: 81, name: 'FC Barcelona' },
   { id: 86, name: 'Real Madrid' },
   { id: Number(process.env.DEPOR_ID || 241), name: 'RC Deportivo' },
 ];
 
-// Feeds iCal. Orden de prueba: variable de entorno (admite varias URLs separadas por coma) -> fallbacks.
-const ICS_FEEDS = [
+// Feeds de motor: se prueban en orden hasta que uno devuelva eventos.
+// Variable de entorno (opcional, URLs separadas por coma) -> GitHub motorsport-calendars -> alternativas.
+const FEEDS = [
   {
     category: 'MotoGP',
     env: 'ICS_MOTOGP',
     urls: [
+      `${GH}motogp.ics`,
+      `${GH}motogp-2026.ics`,
       'https://files-f1cal.b-cdn.net/motogp-2026.ics',
-      'https://raw.githubusercontent.com/motorsport-calendars/calendars/main/motogp.ics',
       'https://files-motogp.motorsportcalendars.com/motogp-calendar.ics',
     ],
   },
   {
     category: 'WRC',
     env: 'ICS_WRC',
-    urls: [
-      'https://raw.githubusercontent.com/motorsport-calendars/calendars/main/wrc.ics',
-      'https://files-wrc.motorsportcalendars.com/wrc-calendar.ics',
-    ],
+    urls: [`${GH}wrc.ics`, `${GH}wrc-2026.ics`, 'https://files-wrc.motorsportcalendars.com/wrc-calendar.ics'],
   },
   {
     category: 'WEC',
     env: 'ICS_WEC',
-    urls: [
-      'https://raw.githubusercontent.com/motorsport-calendars/calendars/main/wec.ics',
-      'https://files-wec.motorsportcalendars.com/wec-calendar.ics',
-    ],
+    urls: [`${GH}wec.ics`, `${GH}wec-2026.ics`, 'https://files-wec.motorsportcalendars.com/wec-calendar.ics'],
   },
   {
     category: 'GT',
     env: 'ICS_GT',
     urls: [
-      'https://raw.githubusercontent.com/motorsport-calendars/calendars/main/gt-world-challenge-europe.ics',
+      `${GH}gt.ics`,
+      `${GH}gtwc-europe.ics`,
+      `${GH}gt-world-challenge-europe.ics`,
       'https://files-gt-world-challenge-europe.motorsportcalendars.com/gt-world-challenge-europe-calendar.ics',
     ],
   },
@@ -55,164 +51,180 @@ const get = (url, headers = {}) =>
     return r;
   });
 
-const iso = (date, time) => new Date(time ? `${date}T${time}` : `${date}T12:00:00Z`).toISOString();
+// ---------- Parser iCal por regex ----------
 
-// ---------- Utilidades iCal ----------
-
-// Acepta Date, {val}, 'YYYYMMDD', 'YYYYMMDDTHHMMSS(Z)' o cualquier string parseable.
-function toDate(v) {
-  if (!v) return null;
-  if (v instanceof Date) return isNaN(v) ? null : v;
-  if (typeof v === 'object' && v.val !== undefined) return toDate(v.val);
-  const s = String(v).trim();
-  let m = s.match(/^(\d{4})(\d{2})(\d{2})$/); // DTSTART;VALUE=DATE:20260301
-  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12, 0, 0));
-  m = s.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/);
-  if (m) {
-    const [, y, mo, d, h, mi, se] = m.map(Number);
-    return new Date(Date.UTC(y, mo - 1, d, h, mi, se)); // sin Z se asume UTC
+// Convierte una hora local de una zona IANA (TZID) a UTC.
+function zonedToUtc(y, mo, d, h, mi, s, tz) {
+  const guess = Date.UTC(y, mo - 1, d, h, mi, s);
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(guess));
+    const p = Object.fromEntries(parts.map((x) => [x.type, +x.value]));
+    const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+    return new Date(guess - (asUtc - guess));
+  } catch {
+    return new Date(guess);
   }
-  const d = new Date(s);
-  return isNaN(d) ? null : d;
 }
 
-const clean = (v) =>
-  String(v?.val ?? v ?? '')
-    .replace(/\\n/g, ' ')
-    .replace(/\\,/g, ',')
-    .replace(/\s+/g, ' ')
-    .trim();
+// DTSTART[;params]:valor -> Date válido en UTC (o null)
+function parseDt(params = '', value = '') {
+  const v = value.trim();
+  const tz = (params.match(/TZID=([^;:]+)/i) || [])[1];
+  let m = v.match(/^(\d{4})(\d{2})(\d{2})$/); // VALUE=DATE
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12, 0, 0));
+  m = v.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?(Z?)$/);
+  if (!m) return null;
+  const [y, mo, d, h, mi] = [+m[1], +m[2], +m[3], +m[4], +m[5]];
+  const s = +(m[6] || 0);
+  if (m[7] === 'Z' || !tz) return new Date(Date.UTC(y, mo - 1, d, h, mi, s));
+  return zonedToUtc(y, mo, d, h, mi, s, tz);
+}
 
-const normalizeUrl = (u) => u.trim().replace(/^webcal:\/\//i, 'https://');
+const unescape = (s = '') =>
+  s.replace(/\\n/gi, ' ').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\').replace(/\s+/g, ' ').trim();
 
-async function getIcs({ category, env, urls }) {
+function parseIcs(text, category) {
+  // Desdobla líneas (RFC 5545: las continuaciones empiezan por espacio o tab)
+  const body = text.replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '');
+  const blocks = body.split(/BEGIN:VEVENT/i).slice(1);
+  const out = [];
+  for (const raw of blocks) {
+    const block = raw.split(/END:VEVENT/i)[0];
+    const prop = (name) => {
+      const m = block.match(new RegExp(`^${name}((?:;[^:\\n]*)?):(.*)$`, 'mi'));
+      return m ? { params: m[1] || '', value: m[2] || '' } : null;
+    };
+    const dt = prop('DTSTART');
+    const date = dt && parseDt(dt.params, dt.value);
+    if (!date || isNaN(date)) continue;
+    const title = unescape(prop('SUMMARY')?.value) || category;
+    const uid = unescape(prop('UID')?.value);
+    out.push({
+      id: `${category.toLowerCase()}-${uid || `${date.toISOString()}-${title}`}`,
+      title,
+      category, // exacto: 'MotoGP' | 'WRC' | 'WEC' | 'GT'
+      tags: [category],
+      type: 'motorsport',
+      date: date.toISOString(),
+      location: unescape(prop('LOCATION')?.value) || category,
+    });
+  }
+  return out;
+}
+
+async function getMotorsport({ category, env, urls }) {
   const fromEnv = process.env[env] ? process.env[env].split(',') : [];
-  const candidates = [...fromEnv, ...urls].map(normalizeUrl).filter(Boolean);
-
+  const candidates = [...fromEnv, ...urls].map((u) => u.trim().replace(/^webcal:\/\//i, 'https://')).filter(Boolean);
   for (const url of candidates) {
     try {
-      const text = await (await get(url)).text();
-      const parsed = ical.parseICS(text);
-      const events = [];
-
-      for (const e of Object.values(parsed)) {
-        if (!e || e.type !== 'VEVENT') continue;
-        const start = toDate(e.start ?? e.dtstart);
-        if (!start) continue;
-        const title = clean(e.summary) || category;
-        events.push({
-          id: `${category.toLowerCase()}-${clean(e.uid) || `${start.toISOString()}-${title}`}`,
-          title,
-          category, // exactamente 'MotoGP' | 'WRC' | 'WEC' | 'GT'
-          tags: [category],
-          type: 'motorsport',
-          date: start.toISOString(),
-          location: clean(e.location) || category,
-        });
-      }
-
-      if (events.length) {
-        return { events, diagnostics: [`${category}: ${events.length} eventos desde ${url}`] };
-      }
-      console.warn(`[ics:${category}] ${url} -> 0 eventos válidos`);
+      const events = parseIcs(await (await get(url)).text(), category);
+      if (events.length) return { events, diagnostics: [`${category}: ${events.length} eventos desde ${url}`] };
+      console.warn(`[ics:${category}] ${url} -> 0 eventos`);
     } catch (err) {
       console.warn(`[ics:${category}] ${url} -> ${err.message}`);
     }
   }
-  // Silencioso para la interfaz: solo queda en diagnostics y en los logs de Vercel.
   return { events: [], diagnostics: [`${category}: ningún feed respondió`] };
 }
 
 // ---------- F1 (Jolpi / Ergast) ----------
 
 async function getF1() {
-  const data = await (await get(`https://api.jolpi.ca/ergast/f1/${YEAR}.json`)).json();
-  const out = [];
-  for (const race of data.MRData.RaceTable.Races) {
-    const place = `${race.raceName} · ${race.Circuit.Location.locality}, ${race.Circuit.Location.country}`;
-    const sessions = [
-      ['GP', race.date, race.time],
-      ['Clasificación', race.Qualifying?.date, race.Qualifying?.time],
-      ['Sprint', race.Sprint?.date, race.Sprint?.time],
-      ['Clasificación Sprint', race.SprintQualifying?.date, race.SprintQualifying?.time],
-    ];
-    for (const [label, d, t] of sessions) {
-      if (!d) continue;
-      out.push({
-        id: `f1-${race.season}-${race.round}-${label}`,
-        title: `${race.raceName.replace('Grand Prix', 'GP')} – ${label}`,
-        category: 'F1',
-        tags: ['F1'],
-        type: 'motorsport',
-        date: iso(d, t),
-        location: place,
-      });
+  try {
+    const data = await (await get('https://api.jolpi.ca/ergast/f1/2026.json')).json();
+    const out = [];
+    for (const race of data.MRData.RaceTable.Races) {
+      const place = `${race.raceName} · ${race.Circuit.Location.locality}, ${race.Circuit.Location.country}`;
+      const sessions = [
+        ['GP', race.date, race.time],
+        ['Clasificación', race.Qualifying?.date, race.Qualifying?.time],
+        ['Sprint', race.Sprint?.date, race.Sprint?.time],
+        ['Clasificación Sprint', race.SprintQualifying?.date, race.SprintQualifying?.time],
+      ];
+      for (const [label, d, t] of sessions) {
+        if (!d) continue;
+        const date = new Date(t ? `${d}T${t}` : `${d}T12:00:00Z`);
+        if (isNaN(date)) continue;
+        out.push({
+          id: `f1-${race.season}-${race.round}-${label}`,
+          title: `${race.raceName.replace('Grand Prix', 'GP')} – ${label}`,
+          category: 'F1',
+          tags: ['F1'],
+          type: 'motorsport',
+          date: date.toISOString(),
+          location: place,
+        });
+      }
     }
+    return { events: out, diagnostics: [`F1: ${out.length} eventos`] };
+  } catch (err) {
+    console.warn(`[f1] ${err.message}`);
+    return { events: [], diagnostics: ['F1: sin respuesta'] };
   }
-  return out;
 }
 
-// ---------- Fútbol (football-data.org) ----------
+// ---------- Fútbol: LaLiga (PD) + Champions League (CL) ----------
 
-let lastFootball = []; // última respuesta buena, por si hay 429
+// Última respuesta buena por competición, por si hay 429 o fallo de red
+const fdCache = { PD: [], CL: [] };
 
-async function fdMatches(path, headers) {
-  const r = await fetch(`${FD}${path}`, { headers, signal: AbortSignal.timeout(9000) });
-  if (r.status === 429) {
-    const e = new Error('límite de peticiones (429)');
-    e.rateLimited = true;
-    throw e;
+async function getFootballCompetition(code, key) {
+  const isCL = code === 'CL';
+  try {
+    const r = await fetch(`${FD}/competitions/${code}/matches?status=SCHEDULED,TIMED`, {
+      headers: { 'X-Auth-Token': key },
+      signal: AbortSignal.timeout(9000),
+    });
+    if (r.status === 429) {
+      console.warn(`[football:${code}] 429, se sirve la última respuesta guardada`);
+      return { events: fdCache[code], diagnostics: [`${code}: 429, datos en caché`] };
+    }
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+
+    const ours = new Map(TEAMS.map((t) => [t.id, t.name]));
+    const events = [];
+    for (const m of (await r.json()).matches || []) {
+      const mine = [m.homeTeam?.id, m.awayTeam?.id].filter((id) => ours.has(id)).map((id) => ours.get(id));
+      if (!isCL && !mine.length) continue; // en LaLiga solo Barça, Madrid (y Dépor si apareciera)
+      const date = new Date(m.utcDate);
+      if (isNaN(date)) continue;
+      const home = m.homeTeam?.shortName || m.homeTeam?.name || 'Por definir';
+      const away = m.awayTeam?.shortName || m.awayTeam?.name || 'Por definir';
+      events.push({
+        id: `fd-${m.id}`,
+        title: `${home} vs ${away}`,
+        category: mine[0] || (isCL ? 'Champions League' : 'LaLiga'),
+        tags: isCL ? [...mine, 'Champions'] : mine, // un Barça–Madrid sale en ambos filtros
+        type: 'futbol',
+        date: date.toISOString(),
+        location: m.competition?.name || (isCL ? 'UEFA Champions League' : 'LaLiga'),
+      });
+    }
+    fdCache[code] = events;
+    return { events, diagnostics: [`${code}: ${events.length} partidos`] };
+  } catch (err) {
+    console.warn(`[football:${code}] ${err.message}`);
+    return { events: fdCache[code], diagnostics: [`${code}: ${err.message}`] };
   }
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return (await r.json()).matches || [];
 }
 
 async function getFootball() {
   const key = process.env.FOOTBALL_DATA_KEY;
-  if (!key) return { events: [], warnings: ['Fútbol: falta FOOTBALL_DATA_KEY'] };
-  const headers = { 'X-Auth-Token': key };
-  const q = '?status=SCHEDULED,TIMED';
-  const ours = new Map(TEAMS.map((t) => [t.id, t.name]));
-  const warnings = [];
-  const byId = new Map();
-
-  const add = (m, isCL) => {
-    const date = new Date(m.utcDate);
-    const mine = [m.homeTeam.id, m.awayTeam.id].filter((id) => ours.has(id)).map((id) => ours.get(id));
-    if (!isCL && !mine.length) return; // en la liga solo nos interesan nuestros equipos
-    const id = `fd-${m.id}`;
-    const ev = byId.get(id) || {
-      id,
-      title: `${m.homeTeam.shortName || m.homeTeam.name} vs ${m.awayTeam.shortName || m.awayTeam.name}`,
-      category: mine[0] || 'Champions League',
-      tags: [],
-      type: 'futbol',
-      date: date.toISOString(),
-      location: m.competition?.name || (isCL ? 'UEFA Champions League' : 'LaLiga'),
-    };
-    mine.forEach((n) => !ev.tags.includes(n) && ev.tags.push(n));
-    if (isCL && !ev.tags.includes('Champions')) ev.tags.push('Champions');
-    byId.set(id, ev);
+  if (!key) return { events: [], diagnostics: ['Fútbol: falta FOOTBALL_DATA_KEY'] };
+  // 2 peticiones en total (muy por debajo de las 10/min del plan gratuito)
+  const [liga, champions] = await Promise.all([
+    getFootballCompetition('PD', key),
+    getFootballCompetition('CL', key),
+  ]);
+  return {
+    events: [...liga.events, ...champions.events],
+    diagnostics: [...liga.diagnostics, ...champions.diagnostics],
   };
-
-  // 1 petición a toda la liga (filtrada en local) + 1 a la Champions
-  const jobs = [
-    ['LaLiga', `/competitions/PD/matches${q}`, false],
-    ['Champions League', `/competitions/CL/matches${q}`, true],
-  ];
-  let rateLimited = false;
-  for (const [label, path, isCL] of jobs) {
-    try {
-      (await fdMatches(path, headers)).forEach((m) => add(m, isCL));
-    } catch (err) {
-      if (err.rateLimited) rateLimited = true;
-      warnings.push(`${label}: ${err.message}`);
-    }
-  }
-
-  if (byId.size) lastFootball = [...byId.values()];
-  const events = byId.size ? [...byId.values()] : rateLimited ? lastFootball : [];
-  return { events, warnings };
 }
 
 // ---------- Handler ----------
@@ -223,36 +235,30 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const jobs = [
-    { label: 'F1', run: getF1 },
-    ...ICS_FEEDS.map((f) => ({ label: f.category, run: () => getIcs(f) })),
-    { label: 'Fútbol', run: getFootball },
-  ];
-  const settled = await Promise.allSettled(jobs.map((j) => j.run()));
+  const jobs = [getF1(), ...FEEDS.map(getMotorsport), getFootball()];
+  const settled = await Promise.allSettled(jobs);
 
-  const warnings = []; // se muestran en la interfaz
-  const diagnostics = []; // solo para depurar, la interfaz no los pinta
   let events = [];
-  settled.forEach((r, i) => {
-    if (r.status === 'rejected') return warnings.push(`${jobs[i].label}: ${r.reason.message}`);
-    if (Array.isArray(r.value)) return (events = events.concat(r.value));
-    events = events.concat(r.value.events);
-    warnings.push(...(r.value.warnings || []));
+  const diagnostics = [];
+  for (const r of settled) {
+    if (r.status !== 'fulfilled') continue; // fallo silencioso
+    events = events.concat(r.value.events || []);
     diagnostics.push(...(r.value.diagnostics || []));
-  });
+  }
 
-  // Todo el año 2026 (desde el 1 de enero), sin descartar eventos ya pasados; sin duplicados.
+  // Desde el inicio de HOY (UTC) en adelante, sin duplicados, orden ascendente estricto
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
   const seen = new Set();
   events = events
     .filter((e) => {
-      const t = new Date(e.date).getTime();
-      if (isNaN(t) || t < YEAR_START || t >= YEAR_END) return false;
-      if (seen.has(e.id)) return false;
+      const t = Date.parse(e.date);
+      if (isNaN(t) || t < today.getTime() || seen.has(e.id)) return false;
       seen.add(e.id);
       return true;
     })
-    .sort((a, b) => new Date(a.date) - new Date(b.date));
+    .sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
 
   res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=3600');
-  res.status(200).json({ updatedAt: new Date().toISOString(), count: events.length, warnings, diagnostics, events });
+  res.status(200).json({ updatedAt: new Date().toISOString(), count: events.length, warnings: [], diagnostics, events });
 }

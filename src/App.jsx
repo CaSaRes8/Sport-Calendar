@@ -149,7 +149,6 @@ export default function App() {
                 <div className="min-w-0 flex-1">
                   <span className={`inline-block rounded-full border px-2 py-0.5 text-[10px] font-semibold ${s.badge}`}>{e.category}</span>
                   <h2 className="mt-1 text-sm font-semibold leading-snug">
-                    <span className="mr-1">{s.emoji}</span>
                     {e.title}
                   </h2>
                   <p className="mt-1 flex items-center gap-1 text-xs text-slate-400">

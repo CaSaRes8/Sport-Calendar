@@ -1,19 +1,29 @@
 const FD = 'https://api.football-data.org/v4';
-const TSDB = 'https://www.thesportsdb.com/api/v1/json/3/eventsnextleague.php?id=';
+const TSDB = 'https://www.thesportsdb.com/api/v1/json/3/eventsseason.php';
 
-// Equipos a destacar en LaLiga y en Champions (football-data.org)
-const TEAMS = [
-  { id: 81, name: 'FC Barcelona' },
-  { id: 86, name: 'Real Madrid' },
-  { id: Number(process.env.DEPOR_ID || 241), name: 'RC Deportivo' },
-];
+const F1_SEASONS = [2026, 2027];
+const MOTOR_SEASONS = [2026, 2027];
 
-// Motor: TheSportsDB (API key gratuita '3')
+// Motor vía TheSportsDB (clave pública gratuita '3')
 const MOTOR = [
   { category: 'MotoGP', emoji: '🏍️', leagueId: 4407 },
   { category: 'WRC', emoji: '🚗', leagueId: 4409 },
   { category: 'WEC', emoji: '🏁', leagueId: 4413 },
   { category: 'GT', emoji: '🚘', leagueId: 4487 },
+];
+
+// Equipos de fútbol. Se identifican por ID o por nombre (el Deportivo NO puede
+// coincidir solo con "Deportivo": "Deportivo Alavés" también lo contiene).
+const TEAMS = [
+  { name: 'FC Barcelona', emoji: '🔵🔴', match: (t) => t?.id === 81 },
+  { name: 'Real Madrid', emoji: '⚪', match: (t) => t?.id === 86 },
+  {
+    name: 'RC Deportivo',
+    emoji: '🔵⚪',
+    match: (t) =>
+      t?.id === 560 ||
+      (/deportivo/i.test(`${t?.name} ${t?.shortName}`) && /coru[nñ]a/i.test(`${t?.name} ${t?.shortName}`)),
+  },
 ];
 
 const get = (url, headers = {}) =>
@@ -22,23 +32,50 @@ const get = (url, headers = {}) =>
     return r;
   });
 
-// ---------- Motor: TheSportsDB ----------
+// ---------- Fórmula 1 (Jolpi / Ergast) ----------
 
-async function getMotorsport({ category, emoji, leagueId }) {
+async function getF1Season(year) {
   try {
-    const data = await (await get(`${TSDB}${leagueId}`)).json();
-    // events === null: temporada acabada o aún sin publicar -> se ignora la categoría sin error
-    if (!data || !Array.isArray(data.events)) {
-      return { events: [], diagnostics: [`${category}: sin eventos publicados`] };
+    const data = await (await get(`https://api.jolpi.ca/ergast/f1/${year}.json`)).json();
+    const out = [];
+    for (const r of data?.MRData?.RaceTable?.Races || []) {
+      const date = new Date(`${r.date}T${r.time || '14:00:00Z'}`);
+      if (isNaN(date)) continue;
+      const loc = r.Circuit?.Location || {};
+      out.push({
+        id: `f1-${r.season}-${r.round}`,
+        title: `🏎️ F1: ${r.raceName}`,
+        category: 'F1',
+        tags: ['F1'],
+        type: 'motorsport',
+        date: date.toISOString(),
+        location: [r.Circuit?.circuitName, [loc.locality, loc.country].filter(Boolean).join(', ')]
+          .filter(Boolean)
+          .join(' · ') || 'F1',
+      });
     }
+    return { events: out, diagnostics: [`F1 ${year}: ${out.length} carreras`] };
+  } catch (err) {
+    console.warn(`[f1:${year}] ${err.message}`);
+    return { events: [], diagnostics: [`F1 ${year}: ${err.message}`] };
+  }
+}
 
+// ---------- Motor (TheSportsDB eventsseason) ----------
+
+async function getMotorSeason({ category, emoji, leagueId }, season) {
+  try {
+    const data = await (await get(`${TSDB}?id=${leagueId}&s=${season}`)).json();
+    if (!data || !Array.isArray(data.events)) {
+      return { events: [], diagnostics: [`${category} ${season}: sin eventos publicados`] };
+    }
     const out = [];
     for (const ev of data.events) {
       if (!ev?.dateEvent) continue;
-      const time = String(ev.strTime || '').match(/^\d{2}:\d{2}(:\d{2})?/)?.[0] || '12:00:00';
-      const date = new Date(`${ev.dateEvent}T${time.length === 5 ? `${time}:00` : time}Z`);
+      let time = String(ev.strTime || '').match(/^\d{2}:\d{2}(:\d{2})?/)?.[0] || '12:00:00';
+      if (time.length === 5) time += ':00';
+      const date = new Date(`${ev.dateEvent}T${time}Z`);
       if (isNaN(date)) continue;
-
       const location = [ev.strVenue, ev.strCountry].map((s) => (s || '').trim()).filter(Boolean).join(', ');
       out.push({
         id: `${category.toLowerCase()}-${ev.idEvent}`,
@@ -50,57 +87,24 @@ async function getMotorsport({ category, emoji, leagueId }) {
         location: location || category,
       });
     }
-    return { events: out, diagnostics: [`${category}: ${out.length} eventos`] };
+    return { events: out, diagnostics: [`${category} ${season}: ${out.length} eventos`] };
   } catch (err) {
-    console.warn(`[tsdb:${category}] ${err.message}`);
-    return { events: [], diagnostics: [`${category}: ${err.message}`] };
+    console.warn(`[tsdb:${category}:${season}] ${err.message}`);
+    return { events: [], diagnostics: [`${category} ${season}: ${err.message}`] };
   }
 }
 
-// ---------- F1 (Jolpi / Ergast) ----------
-
-async function getF1() {
-  try {
-    const data = await (await get('https://api.jolpi.ca/ergast/f1/2026.json')).json();
-    const out = [];
-    for (const race of data.MRData.RaceTable.Races) {
-      const place = `${race.raceName} · ${race.Circuit.Location.locality}, ${race.Circuit.Location.country}`;
-      const sessions = [
-        ['GP', race.date, race.time],
-        ['Clasificación', race.Qualifying?.date, race.Qualifying?.time],
-        ['Sprint', race.Sprint?.date, race.Sprint?.time],
-        ['Clasificación Sprint', race.SprintQualifying?.date, race.SprintQualifying?.time],
-      ];
-      for (const [label, d, t] of sessions) {
-        if (!d) continue;
-        const date = new Date(t ? `${d}T${t}` : `${d}T12:00:00Z`);
-        if (isNaN(date)) continue;
-        out.push({
-          id: `f1-${race.season}-${race.round}-${label}`,
-          title: `${race.raceName.replace('Grand Prix', 'GP')} – ${label}`,
-          category: 'F1',
-          tags: ['F1'],
-          type: 'motorsport',
-          date: date.toISOString(),
-          location: place,
-        });
-      }
-    }
-    return { events: out, diagnostics: [`F1: ${out.length} eventos`] };
-  } catch (err) {
-    console.warn(`[f1] ${err.message}`);
-    return { events: [], diagnostics: ['F1: sin respuesta'] };
-  }
-}
-
-// ---------- Fútbol: LaLiga (PD) + Champions League (CL) ----------
+// ---------- Fútbol (football-data.org v4) ----------
 
 // Última respuesta buena por competición, por si hay 429 o fallo de red
 const fdCache = { PD: [], CL: [] };
 
+const teamLabel = (t) => t?.shortName || t?.name || 'Por definir';
+
 async function getFootballCompetition(code, key) {
   const isCL = code === 'CL';
   try {
+    // SCHEDULED = fecha sin hora confirmada; TIMED = hora confirmada. Se piden ambos.
     const r = await fetch(`${FD}/competitions/${code}/matches?status=SCHEDULED,TIMED`, {
       headers: { 'X-Auth-Token': key },
       signal: AbortSignal.timeout(9000),
@@ -111,20 +115,20 @@ async function getFootballCompetition(code, key) {
     }
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
 
-    const ours = new Map(TEAMS.map((t) => [t.id, t.name]));
     const events = [];
     for (const m of (await r.json()).matches || []) {
-      const mine = [m.homeTeam?.id, m.awayTeam?.id].filter((id) => ours.has(id)).map((id) => ours.get(id));
-      if (!isCL && !mine.length) continue; // en LaLiga solo Barça, Madrid (y Dépor si apareciera)
+      const mine = TEAMS.filter((t) => t.match(m.homeTeam) || t.match(m.awayTeam));
+      if (!isCL && !mine.length) continue; // en LaLiga solo nuestros equipos
       const date = new Date(m.utcDate);
       if (isNaN(date)) continue;
-      const home = m.homeTeam?.shortName || m.homeTeam?.name || 'Por definir';
-      const away = m.awayTeam?.shortName || m.awayTeam?.name || 'Por definir';
+
+      const emoji = isCL ? '🏆' : mine[0].emoji;
       events.push({
         id: `fd-${m.id}`,
-        title: `${home} vs ${away}`,
-        category: mine[0] || (isCL ? 'Champions League' : 'LaLiga'),
-        tags: isCL ? [...mine, 'Champions'] : mine, // un Barça–Madrid sale en ambos filtros
+        title: `${emoji} ${teamLabel(m.homeTeam)} vs ${teamLabel(m.awayTeam)}`,
+        category: isCL ? 'Champions League' : mine[0].name,
+        // tags: los partidos de Champions de nuestros equipos también salen en sus filtros
+        tags: isCL ? ['Champions', ...mine.map((t) => t.name)] : mine.map((t) => t.name),
         type: 'futbol',
         date: date.toISOString(),
         location: m.competition?.name || (isCL ? 'UEFA Champions League' : 'LaLiga'),
@@ -141,7 +145,7 @@ async function getFootballCompetition(code, key) {
 async function getFootball() {
   const key = process.env.FOOTBALL_DATA_KEY;
   if (!key) return { events: [], diagnostics: ['Fútbol: falta FOOTBALL_DATA_KEY'] };
-  // 2 peticiones en total (muy por debajo de las 10/min del plan gratuito)
+  // Una petición por competición (2 en total)
   const [liga, champions] = await Promise.all([
     getFootballCompetition('PD', key),
     getFootballCompetition('CL', key),
@@ -160,7 +164,11 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const jobs = [getF1(), ...MOTOR.map(getMotorsport), getFootball()];
+  const jobs = [
+    ...F1_SEASONS.map(getF1Season),
+    ...MOTOR.flatMap((m) => MOTOR_SEASONS.map((s) => getMotorSeason(m, s))),
+    getFootball(),
+  ];
   const settled = await Promise.allSettled(jobs);
 
   let events = [];
@@ -171,7 +179,7 @@ export default async function handler(req, res) {
     diagnostics.push(...(r.value.diagnostics || []));
   }
 
-  // Desde el inicio de HOY (UTC) en adelante, sin duplicados, orden ascendente estricto
+  // Desde las 00:00:00 de hoy (UTC) en adelante, sin duplicados, orden ascendente
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
   const seen = new Set();
@@ -184,6 +192,6 @@ export default async function handler(req, res) {
     })
     .sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
 
-  res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=3600');
+  res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate');
   res.status(200).json({ updatedAt: new Date().toISOString(), count: events.length, warnings: [], diagnostics, events });
 }

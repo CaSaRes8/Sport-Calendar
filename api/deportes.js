@@ -1,7 +1,5 @@
-import { Buffer } from 'node:buffer'; // (sin uso real; se puede borrar, no afecta)
-
 const FD = 'https://api.football-data.org/v4';
-const GH = 'https://raw.githubusercontent.com/motorsport-calendars/calendars/main/';
+const TSDB = 'https://www.thesportsdb.com/api/v1/json/3/eventsnextleague.php?id=';
 
 // Equipos a destacar en LaLiga y en Champions (football-data.org)
 const TEAMS = [
@@ -10,39 +8,12 @@ const TEAMS = [
   { id: Number(process.env.DEPOR_ID || 241), name: 'RC Deportivo' },
 ];
 
-// Feeds de motor: se prueban en orden hasta que uno devuelva eventos.
-// Variable de entorno (opcional, URLs separadas por coma) -> GitHub motorsport-calendars -> alternativas.
-const FEEDS = [
-  {
-    category: 'MotoGP',
-    env: 'ICS_MOTOGP',
-    urls: [
-      `${GH}motogp.ics`,
-      `${GH}motogp-2026.ics`,
-      'https://files-f1cal.b-cdn.net/motogp-2026.ics',
-      'https://files-motogp.motorsportcalendars.com/motogp-calendar.ics',
-    ],
-  },
-  {
-    category: 'WRC',
-    env: 'ICS_WRC',
-    urls: [`${GH}wrc.ics`, `${GH}wrc-2026.ics`, 'https://files-wrc.motorsportcalendars.com/wrc-calendar.ics'],
-  },
-  {
-    category: 'WEC',
-    env: 'ICS_WEC',
-    urls: [`${GH}wec.ics`, `${GH}wec-2026.ics`, 'https://files-wec.motorsportcalendars.com/wec-calendar.ics'],
-  },
-  {
-    category: 'GT',
-    env: 'ICS_GT',
-    urls: [
-      `${GH}gt.ics`,
-      `${GH}gtwc-europe.ics`,
-      `${GH}gt-world-challenge-europe.ics`,
-      'https://files-gt-world-challenge-europe.motorsportcalendars.com/gt-world-challenge-europe-calendar.ics',
-    ],
-  },
+// Motor: TheSportsDB (API key gratuita '3')
+const MOTOR = [
+  { category: 'MotoGP', emoji: '🏍️', leagueId: 4407 },
+  { category: 'WRC', emoji: '🚗', leagueId: 4409 },
+  { category: 'WEC', emoji: '🏁', leagueId: 4413 },
+  { category: 'GT', emoji: '🚘', leagueId: 4487 },
 ];
 
 const get = (url, headers = {}) =>
@@ -51,85 +22,39 @@ const get = (url, headers = {}) =>
     return r;
   });
 
-// ---------- Parser iCal por regex ----------
+// ---------- Motor: TheSportsDB ----------
 
-// Convierte una hora local de una zona IANA (TZID) a UTC.
-function zonedToUtc(y, mo, d, h, mi, s, tz) {
-  const guess = Date.UTC(y, mo - 1, d, h, mi, s);
+async function getMotorsport({ category, emoji, leagueId }) {
   try {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      hourCycle: 'h23',
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-    }).formatToParts(new Date(guess));
-    const p = Object.fromEntries(parts.map((x) => [x.type, +x.value]));
-    const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
-    return new Date(guess - (asUtc - guess));
-  } catch {
-    return new Date(guess);
-  }
-}
-
-// DTSTART[;params]:valor -> Date válido en UTC (o null)
-function parseDt(params = '', value = '') {
-  const v = value.trim();
-  const tz = (params.match(/TZID=([^;:]+)/i) || [])[1];
-  let m = v.match(/^(\d{4})(\d{2})(\d{2})$/); // VALUE=DATE
-  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12, 0, 0));
-  m = v.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?(Z?)$/);
-  if (!m) return null;
-  const [y, mo, d, h, mi] = [+m[1], +m[2], +m[3], +m[4], +m[5]];
-  const s = +(m[6] || 0);
-  if (m[7] === 'Z' || !tz) return new Date(Date.UTC(y, mo - 1, d, h, mi, s));
-  return zonedToUtc(y, mo, d, h, mi, s, tz);
-}
-
-const unescape = (s = '') =>
-  s.replace(/\\n/gi, ' ').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\').replace(/\s+/g, ' ').trim();
-
-function parseIcs(text, category) {
-  // Desdobla líneas (RFC 5545: las continuaciones empiezan por espacio o tab)
-  const body = text.replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '');
-  const blocks = body.split(/BEGIN:VEVENT/i).slice(1);
-  const out = [];
-  for (const raw of blocks) {
-    const block = raw.split(/END:VEVENT/i)[0];
-    const prop = (name) => {
-      const m = block.match(new RegExp(`^${name}((?:;[^:\\n]*)?):(.*)$`, 'mi'));
-      return m ? { params: m[1] || '', value: m[2] || '' } : null;
-    };
-    const dt = prop('DTSTART');
-    const date = dt && parseDt(dt.params, dt.value);
-    if (!date || isNaN(date)) continue;
-    const title = unescape(prop('SUMMARY')?.value) || category;
-    const uid = unescape(prop('UID')?.value);
-    out.push({
-      id: `${category.toLowerCase()}-${uid || `${date.toISOString()}-${title}`}`,
-      title,
-      category, // exacto: 'MotoGP' | 'WRC' | 'WEC' | 'GT'
-      tags: [category],
-      type: 'motorsport',
-      date: date.toISOString(),
-      location: unescape(prop('LOCATION')?.value) || category,
-    });
-  }
-  return out;
-}
-
-async function getMotorsport({ category, env, urls }) {
-  const fromEnv = process.env[env] ? process.env[env].split(',') : [];
-  const candidates = [...fromEnv, ...urls].map((u) => u.trim().replace(/^webcal:\/\//i, 'https://')).filter(Boolean);
-  for (const url of candidates) {
-    try {
-      const events = parseIcs(await (await get(url)).text(), category);
-      if (events.length) return { events, diagnostics: [`${category}: ${events.length} eventos desde ${url}`] };
-      console.warn(`[ics:${category}] ${url} -> 0 eventos`);
-    } catch (err) {
-      console.warn(`[ics:${category}] ${url} -> ${err.message}`);
+    const data = await (await get(`${TSDB}${leagueId}`)).json();
+    // events === null: temporada acabada o aún sin publicar -> se ignora la categoría sin error
+    if (!data || !Array.isArray(data.events)) {
+      return { events: [], diagnostics: [`${category}: sin eventos publicados`] };
     }
+
+    const out = [];
+    for (const ev of data.events) {
+      if (!ev?.dateEvent) continue;
+      const time = String(ev.strTime || '').match(/^\d{2}:\d{2}(:\d{2})?/)?.[0] || '12:00:00';
+      const date = new Date(`${ev.dateEvent}T${time.length === 5 ? `${time}:00` : time}Z`);
+      if (isNaN(date)) continue;
+
+      const location = [ev.strVenue, ev.strCountry].map((s) => (s || '').trim()).filter(Boolean).join(', ');
+      out.push({
+        id: `${category.toLowerCase()}-${ev.idEvent}`,
+        title: `${emoji} ${ev.strEvent || category}`,
+        category, // exacto: 'MotoGP' | 'WRC' | 'WEC' | 'GT'
+        tags: [category],
+        type: 'motorsport',
+        date: date.toISOString(),
+        location: location || category,
+      });
+    }
+    return { events: out, diagnostics: [`${category}: ${out.length} eventos`] };
+  } catch (err) {
+    console.warn(`[tsdb:${category}] ${err.message}`);
+    return { events: [], diagnostics: [`${category}: ${err.message}`] };
   }
-  return { events: [], diagnostics: [`${category}: ningún feed respondió`] };
 }
 
 // ---------- F1 (Jolpi / Ergast) ----------
@@ -235,7 +160,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const jobs = [getF1(), ...FEEDS.map(getMotorsport), getFootball()];
+  const jobs = [getF1(), ...MOTOR.map(getMotorsport), getFootball()];
   const settled = await Promise.allSettled(jobs);
 
   let events = [];

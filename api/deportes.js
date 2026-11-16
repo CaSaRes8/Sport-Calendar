@@ -1,16 +1,7 @@
 const FD = 'https://api.football-data.org/v4';
-const TSDB = 'https://www.thesportsdb.com/api/v1/json/3/eventsseason.php';
 
 const F1_SEASONS = [2026, 2027];
 const MOTOR_SEASONS = [2026, 2027];
-
-// Motor vía TheSportsDB (clave pública gratuita '3')
-const MOTOR = [
-  { category: 'MotoGP', emoji: '🏍️', leagueId: 4407 },
-  { category: 'WRC', emoji: '🚗', leagueId: 4409 },
-  { category: 'WEC', emoji: '🏁', leagueId: 4413 },
-  { category: 'GT', emoji: '🚘', leagueId: 4487 },
-];
 
 // Equipos de fútbol. Se identifican por ID o por nombre (el Deportivo NO puede
 // coincidir solo con "Deportivo": "Deportivo Alavés" también lo contiene).
@@ -61,36 +52,132 @@ async function getF1Season(year) {
   }
 }
 
-// ---------- Motor (TheSportsDB eventsseason) ----------
+// ---------- Motor: MotoGP, WRC, WEC, GT ----------
+// 1) JSON remoto de GitHub (formato sportstimes: { races: [{ name, location, slug, sessions: { race|gp } }] })
+// 2) Si no hay datos remotos para 2027, calendario estático de abajo.
 
-async function getMotorSeason({ category, emoji, leagueId }, season) {
-  try {
-    const data = await (await get(`${TSDB}?id=${leagueId}&s=${season}`)).json();
-    if (!data || !Array.isArray(data.events)) {
-      return { events: [], diagnostics: [`${category} ${season}: sin eventos publicados`] };
-    }
-    const out = [];
-    for (const ev of data.events) {
-      if (!ev?.dateEvent) continue;
-      let time = String(ev.strTime || '').match(/^\d{2}:\d{2}(:\d{2})?/)?.[0] || '12:00:00';
-      if (time.length === 5) time += ':00';
-      const date = new Date(`${ev.dateEvent}T${time}Z`);
-      if (isNaN(date)) continue;
-      const location = [ev.strVenue, ev.strCountry].map((s) => (s || '').trim()).filter(Boolean).join(', ');
-      out.push({
-        id: `${category.toLowerCase()}-${ev.idEvent}`,
-        title: `${emoji} ${ev.strEvent || category}`,
-        category, // exacto: 'MotoGP' | 'WRC' | 'WEC' | 'GT'
-        tags: [category],
-        type: 'motorsport',
-        date: date.toISOString(),
-        location: location || category,
+const MOTOR = [
+  { category: 'MotoGP', emoji: '🏍️', slug: 'motogp', env: 'JSON_MOTOGP' },
+  { category: 'WRC', emoji: '🚗', slug: 'wrc', env: 'JSON_WRC' },
+  { category: 'WEC', emoji: '🏁', slug: 'wec', env: 'JSON_WEC' },
+  { category: 'GT', emoji: '🚘', slug: 'gt', env: 'JSON_GT' },
+];
+
+const GH = 'https://raw.githubusercontent.com/sportstimes';
+
+// La variable de entorno (opcional) admite varias URLs separadas por coma y el marcador {year}.
+const remoteUrls = ({ slug, env }, year) => [
+  ...(process.env[env] ? process.env[env].split(',').map((u) => u.trim().replace('{year}', year)) : []),
+  `${GH}/${slug}/main/_db/${slug}/${year}.json`,
+  `${GH}/f1/main/_db/${slug}/${year}.json`,
+];
+
+async function getRemoteSeason(series, year) {
+  for (const url of remoteUrls(series, year)) {
+    try {
+      const data = await (await get(url)).json();
+      const out = [];
+      (data?.races || []).forEach((race, i) => {
+        const s = race.sessions || {};
+        const date = new Date(s.race || s.gp || '');
+        if (isNaN(date)) return;
+        out.push({
+          id: `${series.slug}-${year}-${race.slug || i}`,
+          title: `${series.emoji} ${series.category}: ${race.name}`,
+          category: series.category, // exacto: 'MotoGP' | 'WRC' | 'WEC' | 'GT'
+          tags: [series.category],
+          type: 'motorsport',
+          date: date.toISOString(),
+          location: race.location || race.name || series.category,
+        });
       });
+      if (out.length) return out;
+    } catch (err) {
+      console.warn(`[${series.slug}:${year}] ${url} -> ${err.message}`);
     }
-    return { events: out, diagnostics: [`${category} ${season}: ${out.length} eventos`] };
+  }
+  return [];
+}
+
+// Calendario 2027 de respaldo. Solo hay fecha (no hora) en las fuentes, así que se fija a las
+// 12:00 UTC y se marca "hora por confirmar". Solo incluye rondas con fecha publicada.
+// [serie, fecha de la carrera/inicio (YYYY-MM-DD), nombre, ubicación]
+const STATIC_2027 = [
+  // MotoGP (carrera del domingo)
+  ['MotoGP', '2027-03-07', 'GP de Tailandia', 'Chang International Circuit, Buriram, Tailandia'],
+  ['MotoGP', '2027-03-14', 'GP de Qatar', 'Lusail International Circuit, Qatar'],
+  ['MotoGP', '2027-04-04', 'GP de Brasil', 'Brasil'],
+  ['MotoGP', '2027-04-11', 'GP de Argentina', 'Autódromo Oscar y Juan Gálvez, Buenos Aires, Argentina'],
+  ['MotoGP', '2027-04-25', 'GP de las Américas', 'Circuit of the Americas, Austin, EE. UU.'],
+  ['MotoGP', '2027-05-09', 'GP de España', 'Circuito de Jerez, España'],
+  ['MotoGP', '2027-05-16', 'GP de Francia', 'Le Mans, Francia'],
+  ['MotoGP', '2027-05-30', 'GP de Italia', 'Mugello, Italia'],
+  ['MotoGP', '2027-06-13', 'GP de Cataluña', 'Circuit de Barcelona-Catalunya, España'],
+  ['MotoGP', '2027-06-27', 'GP de los Países Bajos', 'Assen, Países Bajos'],
+  ['MotoGP', '2027-07-11', 'GP de Alemania', 'Sachsenring, Alemania'],
+  ['MotoGP', '2027-07-18', 'GP de Chequia', 'Brno, Chequia'],
+  ['MotoGP', '2027-08-15', 'GP de Gran Bretaña', 'Silverstone, Reino Unido'],
+  ['MotoGP', '2027-10-17', 'GP de Japón', 'Motegi, Japón'],
+  ['MotoGP', '2027-10-24', 'GP de Malasia', 'Sepang, Malasia'],
+  ['MotoGP', '2027-10-31', 'GP de Indonesia', 'Mandalika, Lombok, Indonesia'],
+  ['MotoGP', '2027-11-14', 'GP de Australia', 'Adelaide Street Circuit, Australia'],
+  ['MotoGP', '2027-11-28', 'GP de Valencia', 'Circuit Ricardo Tormo, Cheste, España'],
+  // WRC (fecha = primer día del rally; el rango va en el título)
+  ['WRC', '2027-01-21', 'Rallye Monte-Carlo (21-24 ene)', 'Mónaco'],
+  ['WRC', '2027-02-18', 'Rally de Suecia (18-21 feb)', 'Suecia'],
+  ['WRC', '2027-03-18', 'Safari Rally Kenia (18-21 mar)', 'Naivasha, Kenia'],
+  ['WRC', '2027-04-08', 'Rally de Croacia (8-11 abr)', 'Croacia'],
+  ['WRC', '2027-05-06', 'Rally Islas Canarias (6-9 may)', 'Islas Canarias, España'],
+  ['WRC', '2027-06-03', 'Rally de Japón (3-6 jun)', 'Japón'],
+  ['WRC', '2027-06-24', 'Acropolis Rally Grecia (24-27 jun)', 'Grecia'],
+  ['WRC', '2027-07-08', "Rally d'Italia (8-11 jul)", 'Italia'],
+  ['WRC', '2027-08-26', 'Rally US (26-29 ago)', 'EE. UU.'],
+  ['WRC', '2027-11-04', 'Rally de Chile (4-7 nov)', 'Chile'],
+  ['WRC', '2027-11-25', 'Rally de Arabia Saudí (25-28 nov)', 'Arabia Saudí'],
+  // WEC (día de la carrera; Le Mans = inicio de las 24 h)
+  ['WEC', '2027-03-27', 'Qatar 1812 km', 'Lusail International Circuit, Qatar'],
+  ['WEC', '2027-04-11', '6 Horas de Imola', 'Autodromo Enzo e Dino Ferrari, Italia'],
+  ['WEC', '2027-04-25', '6 Horas de Silverstone', 'Silverstone, Reino Unido'],
+  ['WEC', '2027-05-15', '6 Horas de Spa-Francorchamps', 'Spa-Francorchamps, Bélgica'],
+  ['WEC', '2027-06-12', '24 Horas de Le Mans (12-13 jun)', 'Circuit de la Sarthe, Francia'],
+  ['WEC', '2027-07-11', '6 Horas de São Paulo', 'Interlagos, Brasil'],
+  ['WEC', '2027-09-12', 'Lone Star Le Mans', 'Circuit of the Americas, Austin, EE. UU.'],
+  // GT World Challenge Europe (Monza queda fuera en 2027; entra Imola)
+  ['GT', '2027-04-17', 'GTWC Europe – Paul Ricard 6H (16-18 abr)', 'Circuit Paul Ricard, Le Castellet, Francia'],
+  ['GT', '2027-05-01', 'GTWC Europe – Brands Hatch Sprint (1-2 may)', 'Brands Hatch, Reino Unido'],
+  ['GT', '2027-05-22', 'GTWC Europe – Imola 3H (21-23 may)', 'Autodromo Enzo e Dino Ferrari, Italia'],
+  ['GT', '2027-06-26', '24 Horas de Spa (23-27 jun)', 'Spa-Francorchamps, Bélgica'],
+  ['GT', '2027-07-17', 'GTWC Europe – Misano Sprint (16-18 jul)', 'Misano, Italia'],
+  ['GT', '2027-07-31', 'GTWC Europe – Magny-Cours Sprint (30 jul-1 ago)', 'Magny-Cours, Francia'],
+  ['GT', '2027-08-28', 'GTWC Europe – Nürburgring 3H (28-29 ago)', 'Nürburgring, Alemania'],
+];
+
+function staticEvents(series) {
+  return STATIC_2027.filter(([cat]) => cat === series.category).map(([, ymd, name, place], i) => ({
+    id: `static-${series.slug}-2027-${i}`,
+    title: `${series.emoji} ${series.category}: ${name}`,
+    category: series.category,
+    tags: [series.category],
+    type: 'motorsport',
+    date: new Date(`${ymd}T12:00:00Z`).toISOString(),
+    location: `${place} · hora por confirmar`,
+  }));
+}
+
+async function getMotorsport(series) {
+  try {
+    const seasons = await Promise.all(MOTOR_SEASONS.map((y) => getRemoteSeason(series, y)));
+    let events = seasons.flat();
+    const has2027 = seasons[MOTOR_SEASONS.indexOf(2027)]?.length > 0;
+    let source = 'remoto';
+    if (!has2027) {
+      events = events.concat(staticEvents(series)); // respaldo solo si el remoto no trae 2027
+      source = events.length ? 'remoto 2026 + respaldo 2027' : 'respaldo 2027';
+    }
+    return { events, diagnostics: [`${series.category}: ${events.length} eventos (${source})`] };
   } catch (err) {
-    console.warn(`[tsdb:${category}:${season}] ${err.message}`);
-    return { events: [], diagnostics: [`${category} ${season}: ${err.message}`] };
+    console.warn(`[motor:${series.category}] ${err.message}`);
+    return { events: staticEvents(series), diagnostics: [`${series.category}: ${err.message} (respaldo 2027)`] };
   }
 }
 
@@ -164,11 +251,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const jobs = [
-    ...F1_SEASONS.map(getF1Season),
-    ...MOTOR.flatMap((m) => MOTOR_SEASONS.map((s) => getMotorSeason(m, s))),
-    getFootball(),
-  ];
+  const jobs = [...F1_SEASONS.map(getF1Season), ...MOTOR.map(getMotorsport), getFootball()];
   const settled = await Promise.allSettled(jobs);
 
   let events = [];

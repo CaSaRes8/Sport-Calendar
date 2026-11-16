@@ -54,7 +54,7 @@ async function getF1Season(year) {
 
 // ---------- Motor: MotoGP, WRC, WEC, GT ----------
 // 1) JSON remoto de GitHub (formato sportstimes: { races: [{ name, location, slug, sessions: { race|gp } }] })
-// 2) Si no hay datos remotos para 2027, calendario estático de abajo.
+// 2) Por cada temporada (2026, 2027) en la que el remoto no devuelva nada, se usa el calendario estático.
 
 const MOTOR = [
   { category: 'MotoGP', emoji: '🏍️', slug: 'motogp', env: 'JSON_MOTOGP' },
@@ -99,10 +99,15 @@ async function getRemoteSeason(series, year) {
   return [];
 }
 
-// Calendario 2027 de respaldo. Solo hay fecha (no hora) en las fuentes, así que se fija a las
-// 12:00 UTC y se marca "hora por confirmar". Solo incluye rondas con fecha publicada.
+// Calendario de respaldo. Las fuentes solo dan día (no hora): se fija a las 12:00 UTC y se marca
+// "hora por confirmar". Solo incluye rondas con fecha publicada.
 // [serie, fecha de la carrera/inicio (YYYY-MM-DD), nombre, ubicación]
-const STATIC_2027 = [
+const STATIC_EVENTS = [
+  // ----- 2026: lo que queda por disputarse (WRC, WEC y GT ya terminaron su temporada 2026) -----
+  ['MotoGP', '2026-11-22', 'GP de Portugal', 'Autódromo Internacional do Algarve, Portimão, Portugal'],
+  ['MotoGP', '2026-11-29', 'GP de Valencia', 'Circuit Ricardo Tormo, Cheste, España'],
+
+  // ----- 2027 -----
   // MotoGP (carrera del domingo)
   ['MotoGP', '2027-03-07', 'GP de Tailandia', 'Chang International Circuit, Buriram, Tailandia'],
   ['MotoGP', '2027-03-14', 'GP de Qatar', 'Lusail International Circuit, Qatar'],
@@ -152,32 +157,40 @@ const STATIC_2027 = [
   ['GT', '2027-08-28', 'GTWC Europe – Nürburgring 3H (28-29 ago)', 'Nürburgring, Alemania'],
 ];
 
-function staticEvents(series) {
-  return STATIC_2027.filter(([cat]) => cat === series.category).map(([, ymd, name, place], i) => ({
-    id: `static-${series.slug}-2027-${i}`,
-    title: `${series.emoji} ${series.category}: ${name}`,
-    category: series.category,
-    tags: [series.category],
-    type: 'motorsport',
-    date: new Date(`${ymd}T12:00:00Z`).toISOString(),
-    location: `${place} · hora por confirmar`,
-  }));
+function staticEvents(series, year) {
+  return STATIC_EVENTS.filter(([cat, ymd]) => cat === series.category && ymd.startsWith(`${year}-`)).map(
+    ([, ymd, name, place], i) => ({
+      id: `static-${series.slug}-${year}-${i}`,
+      title: `${series.emoji} ${series.category}: ${name}`,
+      category: series.category,
+      tags: [series.category],
+      type: 'motorsport',
+      date: new Date(`${ymd}T12:00:00Z`).toISOString(),
+      location: `${place} · hora por confirmar`,
+    })
+  );
 }
 
 async function getMotorsport(series) {
   try {
     const seasons = await Promise.all(MOTOR_SEASONS.map((y) => getRemoteSeason(series, y)));
-    let events = seasons.flat();
-    const has2027 = seasons[MOTOR_SEASONS.indexOf(2027)]?.length > 0;
-    let source = 'remoto';
-    if (!has2027) {
-      events = events.concat(staticEvents(series)); // respaldo solo si el remoto no trae 2027
-      source = events.length ? 'remoto 2026 + respaldo 2027' : 'respaldo 2027';
-    }
-    return { events, diagnostics: [`${series.category}: ${events.length} eventos (${source})`] };
+    let events = [];
+    const sources = [];
+    MOTOR_SEASONS.forEach((year, i) => {
+      if (seasons[i].length) {
+        events = events.concat(seasons[i]);
+        sources.push(`${year} remoto`);
+      } else {
+        const fallback = staticEvents(series, year); // respaldo solo para la temporada sin datos remotos
+        events = events.concat(fallback);
+        if (fallback.length) sources.push(`${year} respaldo`);
+      }
+    });
+    return { events, diagnostics: [`${series.category}: ${events.length} eventos (${sources.join(', ') || 'sin datos'})`] };
   } catch (err) {
     console.warn(`[motor:${series.category}] ${err.message}`);
-    return { events: staticEvents(series), diagnostics: [`${series.category}: ${err.message} (respaldo 2027)`] };
+    const fallback = MOTOR_SEASONS.flatMap((y) => staticEvents(series, y));
+    return { events: fallback, diagnostics: [`${series.category}: ${err.message} (respaldo)`] };
   }
 }
 
